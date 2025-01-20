@@ -1,69 +1,58 @@
 use starknet::ContractAddress;
 use core::array::SpanTrait;
 use core::traits::Into;
+use core::traits::TryInto;
 use core::num::traits::zero::Zero;
 use openzeppelin::token::erc20::interface::{IERC20Dispatcher, IERC20DispatcherTrait};
 mod PouchwizeToken;
 
 #[starknet::interface]
 pub trait IPouchwize<TContractState> {
-    // Core lending operations
+    // Token Registry Functions
+    fn add_lending_token(ref self: TContractState, token: ContractAddress);
+    fn remove_lending_token(ref self: TContractState, token: ContractAddress);
+    fn add_collateral_token(ref self: TContractState, token: ContractAddress);
+    fn remove_collateral_token(ref self: TContractState, token: ContractAddress);
+    fn is_supported_lending_token(self: @TContractState, token: ContractAddress) -> bool;
+    fn is_supported_collateral_token(self: @TContractState, token: ContractAddress) -> bool;
+    fn get_supported_tokens(self: @TContractState) -> Span<ContractAddress>;
+
+    // Core Lending Operations
     fn deposit_collateral(ref self: TContractState, token: ContractAddress, amount: u256);
     fn withdraw_collateral(ref self: TContractState, token: ContractAddress, amount: u256);
     fn request_loan_from_listing(ref self: TContractState, listing_id: u128, amount: u256) -> u128;
     fn repay_loan(ref self: TContractState, loan_id: u128, amount: u256) -> bool;
 
-    // Loan listing management
+    // Loan Listing Management
     fn create_loan_listing(ref self: TContractState, amount: u256, min_amount: u256, max_amount: u256, interest: u16, token: ContractAddress) -> u128;
     fn cancel_loan_listing(ref self: TContractState, listing_id: u128) -> bool;
     fn cancel_loan_request_loan_from_listing(ref self: TContractState, loan_id: u128) -> bool;
 
-    // Risk management
+    // Risk Management
     fn liquidate(ref self: TContractState, loan_id: u128) -> bool;
     fn check_and_liquidate_loans(ref self: TContractState, loan_ids: Array<u128>) -> Array<bool>;
 
-    // Loan status views
+    // View Functions
     fn get_loan_listing(self: @TContractState, listing_id: u128) -> Pouchwize::LoanListing;
-    fn get_loan_details(self: @TContractState, loan_id: u128) -> (u256, u256, u256, u64);
+    fn get_loan_details(self: @TContractState, loan_id: u128) -> Pouchwize::LoanDetails;
     fn get_loan_health(self: @TContractState, loan_id: u128) -> bool;
     fn get_loan_health_ratio(self: @TContractState, loan_id: u128) -> u16;
     fn get_interest_accrued(self: @TContractState, loan_id: u128) -> u256;
-
-    // User status views
     fn get_user_loan_listings(self: @TContractState, user: ContractAddress) -> Span<u128>;
     fn get_user_active_loans(self: @TContractState, user: ContractAddress) -> Span<u128>;
-    fn get_user_health_status(self: @TContractState, user: ContractAddress) -> u8;
+    fn get_user_health_status(self: @TContractState, user: ContractAddress) -> Pouchwize::HealthStatus;
     fn get_borrowing_capacity(self: @TContractState, user: ContractAddress, token: ContractAddress) -> u256;
-
-    // Collateral views
     fn get_collateral_balance(self: @TContractState, user: ContractAddress, token: ContractAddress) -> u256;
     fn get_collateral_value(self: @TContractState, token: ContractAddress, amount: u256) -> u256;
     fn get_total_collateral_value(self: @TContractState, user: ContractAddress) -> u256;
-
-    // Protocol metrics
-    fn get_total_loans(self: @TContractState) -> u128;
-    fn get_total_listings(self: @TContractState) -> u128;
     fn get_available_listings(self: @TContractState) -> Span<u128>;
     fn get_listing_utilization(self: @TContractState, listing_id: u128) -> u256;
     fn get_liquidatable_loans(self: @TContractState) -> Span<u128>;
+    fn get_total_loans(self: @TContractState) -> u128;
+    fn get_total_listings(self: @TContractState) -> u128;
     fn get_liquidation_bonus(self: @TContractState, loan_id: u128) -> u256;
-
-    // Token Distribution
-    fn distribute_test_tokens(ref self: TContractState, recipient: ContractAddress, amount: u256);
-
 }
 
-#[starknet::interface]
-pub trait ISwapRouter<TContractState> {
-    fn swap_exact_tokens_for_tokens(
-        ref self: TContractState, 
-        amount_in: u256,
-        amount_out_min: u256,
-        path: Array<ContractAddress>,
-        to: ContractAddress,
-        deadline: u64
-    ) -> Array<u256>;
-}
 
 
 #[starknet::contract]
@@ -77,7 +66,6 @@ pub mod Pouchwize {
         StorageMapWriteAccess,
         Map,
     };
-    use starknet::syscalls::{deploy_syscall};
 
     const COLLATERAL_RATIO: u16 = 125; // Collateral ratio of 125% (100/0.80) for 80% borrowing power
     const LIQUIDATION_THRESHOLD: u16 = 115;
@@ -85,7 +73,6 @@ pub mod Pouchwize {
     const INITIAL_LENDING_SUPPLY: u256 = 1000000000000000000000000; // 1 million tokens
     const INITIAL_COLLATERAL_SUPPLY: u256 = 1000000000000000000000000; // 1 million tokens
     const INITIAL_EXCHANGE_RATE: u256 = 800000000000000000; // Collateral ratio of 125% (100/0.80) for 80% borrowing power
-    const CLASS_HASH: felt252 = 0x00b04520f6d2f39687102e8f2ae7bc2d6de54c00e09d91f62afc68d4efb8e7b3;
 
 
     #[storage]
@@ -99,13 +86,11 @@ pub mod Pouchwize {
         initialized: bool,
         loan_listings: Map::<u128, LoanListing>,
         listing_count: u128,
-        swap_router: ContractAddress,
         interest_accrued: Map::<u128, u256>,
         liquidation_locks: Map::<u128, bool>,
-        lending_token_supply: u256,
-        collateral_token_supply: u256,
-        exchange_rate: u256,  // Rate between collateral and lending tokens (fixed point with 18 decimals)
-
+        supported_lending_tokens: Map<ContractAddress, bool>,
+        supported_collateral_tokens: Map<ContractAddress, bool>,
+        token_count: u128,
     }
 
     #[event]
@@ -172,6 +157,17 @@ pub mod Pouchwize {
         interest: u16
     }
 
+    #[derive(Drop, Copy, Serde, starknet::Store)]
+    pub struct LoanDetails {
+    principal: u256,
+    collateral_value: u256,
+    interest_accrued: u256,
+    start_timestamp: u64,
+    health_ratio: u16,
+    status: bool
+}
+
+
     #[derive(Drop, starknet::Event)]
     pub struct InterestAccrued {
         loan_id: u128,
@@ -208,135 +204,20 @@ pub mod Pouchwize {
     }
 
     #[derive(Drop, Copy, Serde, starknet::Store)]
-    pub struct CollateralInfo {
-        token: ContractAddress,
-        amount: u256,
-        locked: bool
+    #[allow(starknet::store_no_default_variant)]
+    pub enum HealthStatus {
+        Default,
+        Liquidatable,
+        Warning,
+        Healthy,
+        Excellent
     }
+
+
 
     #[constructor]
     fn constructor(ref self: ContractState) {
-        assert(!self.initialized.read(), 'Already initialized');
-        
-        // Set Sepolia ETH as lending token and STRK as collateral token
-        self.lending_token.write(0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7.try_into().unwrap());
-        self.collateral_token.write(0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d.try_into().unwrap());
-        
-        // Set initial exchange rate
-        self.exchange_rate.write(INITIAL_EXCHANGE_RATE);
-        self.initialized.write(true);
-    }
-
-    
-
-
-    #[generate_trait]
-    pub impl SwapOperations of SwapOperationsTrait {
-        fn execute_swap(
-            ref self: ContractState,
-            token_in: ContractAddress,
-            token_out: ContractAddress,
-            amount_in: u256,
-            min_amount_out: u256
-        ) -> u256 {
-            let router = ISwapRouterDispatcher { contract_address: self.swap_router.read() };
-            let mut path = ArrayTrait::new();
-            path.append(token_in);
-            path.append(token_out);
-            
-            let deadline = get_block_timestamp() + 300;
-            let amounts = router.swap_exact_tokens_for_tokens(
-                amount_in,
-                min_amount_out,
-                path,
-                get_contract_address(),
-                deadline
-            );
-            
-            // Get last element correctly using span
-            let amounts_span = amounts.span();
-            *amounts_span.at(amounts_span.len() - 1)
-        }
-    }
-
-    #[generate_trait]
-    impl TokenManagement of TokenManagementTrait {
-        fn deploy_tokens(
-            ref self: ContractState,
-            lending_name: felt252,
-            lending_symbol: felt252,
-            collateral_name: felt252,
-            collateral_symbol: felt252
-        ) {
-            let contract_address = get_contract_address();
-            
-            // Deploy lending token
-            let lending_token = self._deploy_single_token(
-                lending_name,
-                lending_symbol,
-                INITIAL_LENDING_SUPPLY,
-                contract_address
-            );
-            self.lending_token.write(lending_token);
-            self.lending_token_supply.write(INITIAL_LENDING_SUPPLY);
-
-            // Deploy collateral token
-            let collateral_token = self._deploy_single_token(
-                collateral_name,
-                collateral_symbol,
-                INITIAL_COLLATERAL_SUPPLY,
-                contract_address
-            );
-            self.collateral_token.write(collateral_token);
-            self.collateral_token_supply.write(INITIAL_COLLATERAL_SUPPLY);
-
-            // Set initial exchange rate
-            self.exchange_rate.write(INITIAL_EXCHANGE_RATE);
-        }
-
-        fn _deploy_single_token(
-            self: @ContractState,
-            name: felt252,
-            symbol: felt252,
-            supply: u256,
-            recipient: ContractAddress
-        ) -> ContractAddress {
-            let mut calldata = ArrayTrait::new();
-            calldata.append(name);
-            calldata.append(symbol);
-            calldata.append(supply.low.into());
-            calldata.append(supply.high.into());
-            calldata.append(recipient.into());
-        
-            let (deployed_address, _) = deploy_syscall(
-                CLASS_HASH.try_into().unwrap(),
-                0,
-                calldata.span(),
-                false
-            ).unwrap();
-        
-            deployed_address
-        }
-        
-    }
-
-    #[generate_trait]
-    impl TokenExchange of TokenExchangeTrait {
-        fn get_collateral_to_lending_value(
-            self: @ContractState,
-            collateral_amount: u256
-        ) -> u256 {
-            let rate = self.exchange_rate.read();
-            (collateral_amount * rate) / 1000000000000000000 // Adjust for 18 decimals
-        }
-
-        fn get_lending_to_collateral_value(
-            self: @ContractState,
-            lending_amount: u256
-        ) -> u256 {
-            let rate = self.exchange_rate.read();
-            (lending_amount * 1000000000000000000) / rate // Adjust for 18 decimals
-        }
+        self.admin.write(get_caller_address());
     }
 
 
@@ -377,6 +258,18 @@ pub mod Pouchwize {
 
 
     #[generate_trait]
+    impl TokenExchange of TokenExchangeTrait {
+        fn get_collateral_to_lending_value(
+            self: @ContractState,
+            collateral_amount: u256
+        ) -> u256 {
+            let rate = 800000000000000000; // Fixed rate for now
+            (collateral_amount * rate) / 1000000000000000000
+        }
+    }
+
+
+    #[generate_trait]
     impl CollateralManagement of CollateralManagementTrait {
         fn get_minimum_required_collateral(self: @ContractState, user: ContractAddress) -> u256 {
             let active_loans = self.get_user_active_loans(user);
@@ -396,8 +289,6 @@ pub mod Pouchwize {
             total_required
         }
     }
-
-
 
     #[abi(embed_v0)]
     impl Pouchwize of super::IPouchwize<ContractState> {
@@ -475,6 +366,7 @@ pub mod Pouchwize {
             
             loan_id
         }
+
         fn repay_loan(ref self: ContractState, loan_id: u128, amount: u256) -> bool {
             let loan = self.loans.read(loan_id);
             assert(loan.active, 'Loan not active');
@@ -607,21 +499,88 @@ pub mod Pouchwize {
             results
         }
 
-        fn distribute_test_tokens(ref self: ContractState, recipient: ContractAddress, amount: u256) {
-            TokenDistributionTrait::distribute_test_tokens(ref self, recipient, amount)
+        fn add_lending_token(ref self: ContractState, token: ContractAddress) {
+            let caller = get_caller_address();
+            assert(caller == self.admin.read(), 'Only admin');
+            assert(!token.is_zero(), 'Invalid token address');
+            self.supported_lending_tokens.write(token, true);
+            self.token_count.write(self.token_count.read() + 1);
         }
-
+    
+        fn remove_lending_token(ref self: ContractState, token: ContractAddress) {
+            let caller = get_caller_address();
+            assert(caller == self.admin.read(), 'Only admin');
+            self.supported_lending_tokens.write(token, false);
+            self.token_count.write(self.token_count.read() - 1);
+        }
+    
+        fn add_collateral_token(ref self: ContractState, token: ContractAddress) {
+            let caller = get_caller_address();
+            assert(caller == self.admin.read(), 'Only admin');
+            assert(!token.is_zero(), 'Invalid token address');
+            self.supported_collateral_tokens.write(token, true);
+        }
+    
+        fn remove_collateral_token(ref self: ContractState, token: ContractAddress) {
+            let caller = get_caller_address();
+            assert(caller == self.admin.read(), 'Only admin');
+            self.supported_collateral_tokens.write(token, false);
+        }
+    
+        fn is_supported_lending_token(self: @ContractState, token: ContractAddress) -> bool {
+            self.supported_lending_tokens.read(token)
+        }
+    
+        fn is_supported_collateral_token(self: @ContractState, token: ContractAddress) -> bool {
+            self.supported_collateral_tokens.read(token)
+        }
+    
+        fn get_supported_tokens(self: @ContractState) -> Span<ContractAddress> {
+            let mut tokens = ArrayTrait::new();
+            let total_tokens = self.token_count.read();
+            
+            let mut i: u128 = 1;
+            loop {
+                if i > total_tokens {
+                    break;
+                }
+                let felt: felt252 = i.into();
+                let token_address: ContractAddress = felt.try_into().unwrap();
+                if self.supported_lending_tokens.read(token_address) {
+                    tokens.append(token_address);
+                }
+                i += 1;
+            };
+            
+            tokens.span()
+        }
+        
+        
         // View functions implementation...
         fn get_loan_listing(self: @ContractState, listing_id: u128) -> LoanListing {
-            self.loan_listings.read(listing_id)
+            assert(listing_id > 0, 'Invalid listing ID: must be > 0');
+            assert(listing_id <= self.listing_count.read(), 'Listing does not exist');
+            
+            let listing = self.loan_listings.read(listing_id);
+            assert(listing.status != 2, 'Listing is cancelled');
+            
+            listing
         }
-
-        fn get_loan_details(self: @ContractState, loan_id: u128) -> (u256, u256, u256, u64) {
+        
+        fn get_loan_details(self: @ContractState, loan_id: u128) -> LoanDetails {
+            assert(loan_id > 0, 'Invalid loan ID');
+            assert(loan_id <= self.loan_count.read(), 'Loan does not exist');
+            
             let loan = self.loans.read(loan_id);
-            (loan.amount, 
-            self.get_collateral_value(loan.collateral, loan.amount),
-            self.get_interest_accrued(loan_id),
-            loan.timestamp)
+            
+            LoanDetails {
+                principal: loan.amount,
+                collateral_value: self.get_collateral_value(loan.collateral, loan.amount),
+                interest_accrued: self.get_interest_accrued(loan_id),
+                start_timestamp: loan.timestamp,
+                health_ratio: self.get_loan_health_ratio(loan_id),
+                status: loan.active
+            }
         }
 
         fn get_loan_health(self: @ContractState, loan_id: u128) -> bool {
@@ -683,11 +642,16 @@ pub mod Pouchwize {
             active_loans.span()
         }
         
-        fn get_user_health_status(self: @ContractState, user: ContractAddress) -> u8 {
+        fn get_user_health_status(self: @ContractState, user: ContractAddress) -> HealthStatus {
             let active_loans = self.get_user_active_loans(user);
-            let mut lowest_health: u16 = 1000; // Start with high value
             
+            if active_loans.len() == 0 {
+                return HealthStatus::Default;
+            }
+        
+            let mut lowest_health = COLLATERAL_RATIO * 2;
             let mut i = 0;
+            
             loop {
                 if i >= active_loans.len() {
                     break;
@@ -700,12 +664,14 @@ pub mod Pouchwize {
                 i += 1;
             };
             
-            if lowest_health >= COLLATERAL_RATIO {
-                2 // Healthy
+            if lowest_health >= COLLATERAL_RATIO * 2 {
+                HealthStatus::Excellent
+            } else if lowest_health >= COLLATERAL_RATIO {
+                HealthStatus::Healthy
             } else if lowest_health >= LIQUIDATION_THRESHOLD {
-                1 // Warning
+                HealthStatus::Warning
             } else {
-                0 // Liquidatable
+                HealthStatus::Liquidatable
             }
         }
         
