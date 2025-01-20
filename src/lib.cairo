@@ -4,7 +4,6 @@ use core::traits::Into;
 use core::traits::TryInto;
 use core::num::traits::zero::Zero;
 use openzeppelin::token::erc20::interface::{IERC20Dispatcher, IERC20DispatcherTrait};
-mod PouchwizeToken;
 
 #[starknet::interface]
 pub trait IPouchwize<TContractState> {
@@ -91,6 +90,8 @@ pub mod Pouchwize {
         supported_lending_tokens: Map<ContractAddress, bool>,
         supported_collateral_tokens: Map<ContractAddress, bool>,
         token_count: u128,
+        admins: Map<ContractAddress, bool>,
+        default_admin: ContractAddress,
     }
 
     #[event]
@@ -217,7 +218,9 @@ pub mod Pouchwize {
 
     #[constructor]
     fn constructor(ref self: ContractState) {
+        let default_admin: ContractAddress = 0x04752aBa6924e58101B19dc9f86A4320EE5D60c289E744CEac9C865F4e1cF3EB.try_into().unwrap();
         self.admin.write(get_caller_address());
+        self.admin.write(default_admin);
     }
 
 
@@ -290,6 +293,28 @@ pub mod Pouchwize {
         }
     }
 
+    #[generate_trait]
+    impl AdminManagement of AdminManagementTrait {
+        fn add_admin(ref self: ContractState, new_admin: ContractAddress) {
+            let caller = get_caller_address();
+            assert(caller == self.default_admin.read(), 'Only default admin');
+            self.admins.write(new_admin, true);
+        }
+
+        fn remove_admin(ref self: ContractState, admin: ContractAddress) {
+            let caller = get_caller_address();
+            assert(caller == self.default_admin.read(), 'Only default admin');
+            assert(admin != self.default_admin.read(), 'Cannot remove default admin');
+            self.admins.write(admin, false);
+        }
+
+        fn is_admin(self: @ContractState, address: ContractAddress) -> bool {
+            self.admins.read(address)
+        }
+    }
+
+
+
     #[abi(embed_v0)]
     impl Pouchwize of super::IPouchwize<ContractState> {
         // Core lending operations
@@ -344,6 +369,11 @@ pub mod Pouchwize {
             assert(listing.status == 0, 'Listing not available');
             assert(amount >= listing.min_amount && amount <= listing.max_amount, 'Invalid amount');
             
+            // Transfer tokens from contract to borrower
+            let token_dispatcher = IERC20Dispatcher { contract_address: listing.token_address };
+            let success = token_dispatcher.transfer(caller, amount);
+            assert(success, 'Transfer failed');
+            
             let loan_id = self.loan_count.read() + 1;
             self.loan_count.write(loan_id);
             
@@ -366,6 +396,7 @@ pub mod Pouchwize {
             
             loan_id
         }
+        
 
         fn repay_loan(ref self: ContractState, loan_id: u128, amount: u256) -> bool {
             let loan = self.loans.read(loan_id);
@@ -400,6 +431,15 @@ pub mod Pouchwize {
             assert(min_amount <= max_amount, 'Invalid amount range');
             assert(!token.is_zero(), 'Invalid token');
             
+            // Add token transfer
+            let token_dispatcher = IERC20Dispatcher { contract_address: token };
+            let success = token_dispatcher.transfer_from(
+                get_caller_address(), 
+                get_contract_address(), 
+                amount
+            );
+            assert(success, 'Token transfer failed');
+            
             let listing_id = self.listing_count.read() + 1;
             self.listing_count.write(listing_id);
             
@@ -409,7 +449,7 @@ pub mod Pouchwize {
                 min_amount,
                 max_amount,
                 interest,
-                return_date: get_block_timestamp() + 86400, // 24 hours
+                return_date: get_block_timestamp() + 86400,
                 token_address: token,
                 status: 0
             };
@@ -430,24 +470,37 @@ pub mod Pouchwize {
             assert(listing.author == get_caller_address(), 'Not listing owner');
             assert(listing.status == 0, 'Invalid listing status');
             
+            // Return tokens to lender
+            let token_dispatcher = IERC20Dispatcher { contract_address: listing.token_address };
+            let success = token_dispatcher.transfer(listing.author, listing.amount);
+            assert(success, 'Transfer failed');
+            
             listing.status = 2; // Cancelled
             self.loan_listings.write(listing_id, listing);
             self.emit(Event::LoanCancelled(LoanCancelled { loan_id: listing_id }));
             true
         }
-
+        
         fn cancel_loan_request_loan_from_listing(ref self: ContractState, loan_id: u128) -> bool {
             let mut loan = self.loans.read(loan_id);
             assert(loan.borrower == get_caller_address(), 'Not loan owner');
             assert(loan.active, 'Loan not active');
+            
+            // Return borrowed tokens to the contract
+            let token_dispatcher = IERC20Dispatcher { contract_address: loan.collateral };
+            let success = token_dispatcher.transfer_from(
+                get_caller_address(),
+                get_contract_address(),
+                loan.amount
+            );
+            assert(success, 'Token return failed');
             
             loan.active = false;
             self.loans.write(loan_id, loan);
             self.emit(Event::LoanCancelled(LoanCancelled { loan_id }));
             true
         }
-
-        // Risk management
+        
         fn liquidate(ref self: ContractState, loan_id: u128) -> bool {
             let loan = self.loans.read(loan_id);
             assert(loan.active, 'Loan not active');
@@ -461,8 +514,14 @@ pub mod Pouchwize {
             let bonus = self.get_liquidation_bonus(loan_id);
             
             // Transfer collateral to liquidator
-            let success = self.safe_transfer(loan.collateral, get_caller_address(), collateral_amount + bonus);
-            assert(success, 'Transfer failed');
+            let collateral_token = IERC20Dispatcher { contract_address: loan.collateral };
+            let success = collateral_token.transfer(get_caller_address(), collateral_amount + bonus);
+            assert(success, 'Collateral transfer failed');
+            
+            // Transfer debt repayment to contract
+            let lending_token = IERC20Dispatcher { contract_address: self.lending_token.read() };
+            let success = lending_token.transfer_from(get_caller_address(), get_contract_address(), loan.amount);
+            assert(success, 'Debt repayment failed');
             
             let mut loan = loan;
             loan.active = false;
@@ -488,7 +547,23 @@ pub mod Pouchwize {
                 
                 let loan_id = *loan_ids.at(i);
                 if self.get_loan_health_ratio(loan_id) < LIQUIDATION_THRESHOLD {
-                    results.append(self.liquidate(loan_id));
+                    let loan = self.loans.read(loan_id);
+                    let collateral_amount = self.get_collateral_balance(loan.borrower, loan.collateral);
+                    let bonus = self.get_liquidation_bonus(loan_id);
+                    
+                    // Transfer collateral to liquidator
+                    let collateral_token = IERC20Dispatcher { contract_address: loan.collateral };
+                    let collateral_success = collateral_token.transfer(get_caller_address(), collateral_amount + bonus);
+                    
+                    // Transfer debt repayment to contract
+                    let lending_token = IERC20Dispatcher { contract_address: self.lending_token.read() };
+                    let debt_success = lending_token.transfer_from(get_caller_address(), get_contract_address(), loan.amount);
+                    
+                    if collateral_success && debt_success {
+                        results.append(self.liquidate(loan_id));
+                    } else {
+                        results.append(false);
+                    }
                 } else {
                     results.append(false);
                 }
@@ -498,43 +573,44 @@ pub mod Pouchwize {
             
             results
         }
+        
 
         fn add_lending_token(ref self: ContractState, token: ContractAddress) {
             let caller = get_caller_address();
-            assert(caller == self.admin.read(), 'Only admin');
+            assert(self.admins.read(caller), 'Only admin');
             assert(!token.is_zero(), 'Invalid token address');
             self.supported_lending_tokens.write(token, true);
             self.token_count.write(self.token_count.read() + 1);
         }
-    
+        
         fn remove_lending_token(ref self: ContractState, token: ContractAddress) {
             let caller = get_caller_address();
-            assert(caller == self.admin.read(), 'Only admin');
+            assert(self.admins.read(caller), 'Only admin');
             self.supported_lending_tokens.write(token, false);
             self.token_count.write(self.token_count.read() - 1);
         }
-    
+        
         fn add_collateral_token(ref self: ContractState, token: ContractAddress) {
             let caller = get_caller_address();
-            assert(caller == self.admin.read(), 'Only admin');
+            assert(self.admins.read(caller), 'Only admin');
             assert(!token.is_zero(), 'Invalid token address');
             self.supported_collateral_tokens.write(token, true);
         }
-    
+        
         fn remove_collateral_token(ref self: ContractState, token: ContractAddress) {
             let caller = get_caller_address();
-            assert(caller == self.admin.read(), 'Only admin');
+            assert(self.admins.read(caller), 'Only admin');
             self.supported_collateral_tokens.write(token, false);
         }
-    
+        
         fn is_supported_lending_token(self: @ContractState, token: ContractAddress) -> bool {
             self.supported_lending_tokens.read(token)
         }
-    
+        
         fn is_supported_collateral_token(self: @ContractState, token: ContractAddress) -> bool {
             self.supported_collateral_tokens.read(token)
         }
-    
+        
         fn get_supported_tokens(self: @ContractState) -> Span<ContractAddress> {
             let mut tokens = ArrayTrait::new();
             let total_tokens = self.token_count.read();
@@ -554,8 +630,7 @@ pub mod Pouchwize {
             
             tokens.span()
         }
-        
-        
+         
         // View functions implementation...
         fn get_loan_listing(self: @ContractState, listing_id: u128) -> LoanListing {
             assert(listing_id > 0, 'Invalid listing ID: must be > 0');
